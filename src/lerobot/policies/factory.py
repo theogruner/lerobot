@@ -37,6 +37,7 @@ from lerobot.processor import (
 )
 from lerobot.utils.constants import (
     ACTION,
+    OBS_STATE,
     POLICY_POSTPROCESSOR_DEFAULT_NAME,
     POLICY_PREPROCESSOR_DEFAULT_NAME,
 )
@@ -218,6 +219,25 @@ def make_pre_post_processors(
     )
 
 
+def _dataset_feature_names(ds_meta, key: str, rename_map: dict[str, str] | None) -> list[str] | None:
+    """Per-dimension names of dataset feature ``key`` (after ``rename_map``), or None if absent."""
+    raw_feature = next(
+        (
+            feature
+            for raw_key, feature in ds_meta.features.items()
+            if (rename_map or {}).get(raw_key, raw_key) == key
+        ),
+        None,
+    )
+    names = raw_feature.get("names") if raw_feature is not None else None
+    if names is None:
+        return None
+    # Grouped metadata stores dimension names in the values, not the group keys.
+    if isinstance(names, dict) and all(isinstance(group, (list, tuple)) for group in names.values()):
+        names = [name for group in names.values() for name in group]
+    return list(names)
+
+
 def make_policy(
     cfg: PreTrainedConfig,
     ds_meta: LeRobotDatasetMetadata | None = None,
@@ -295,24 +315,15 @@ def make_policy(
     if not cfg.input_features:
         cfg.input_features = {key: ft for key, ft in features.items() if key not in cfg.output_features}
 
-    # Store action feature names for relative_exclude_joints support
+    # Store action (and state) feature names for relative_exclude_joints and relative pose groups
     if ds_meta is not None and hasattr(cfg, "action_feature_names"):
-        raw_action_feature = next(
-            (
-                feature
-                for raw_key, feature in ds_meta.features.items()
-                if (rename_map or {}).get(raw_key, raw_key) == ACTION
-            ),
-            None,
-        )
-        action_names = raw_action_feature.get("names") if raw_action_feature is not None else None
+        action_names = _dataset_feature_names(ds_meta, ACTION, rename_map)
         if action_names is not None:
-            # Grouped metadata stores dimension names in the values, not the group keys.
-            if isinstance(action_names, dict) and all(
-                isinstance(group, (list, tuple)) for group in action_names.values()
-            ):
-                action_names = [name for group in action_names.values() for name in group]
-            cfg.action_feature_names = list(action_names)
+            cfg.action_feature_names = action_names
+    if ds_meta is not None and hasattr(cfg, "state_feature_names"):
+        state_names = _dataset_feature_names(ds_meta, OBS_STATE, rename_map)
+        if state_names is not None:
+            cfg.state_feature_names = state_names
     if ds_meta is not None:
         set_dataset_feature_metadata = getattr(cfg, "set_dataset_feature_metadata", None)
         if callable(set_dataset_feature_metadata):

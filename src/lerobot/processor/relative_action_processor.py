@@ -22,6 +22,7 @@ from torch import Tensor
 from lerobot.configs import PipelineFeatureType, PolicyFeature
 from lerobot.lerobot_types import EnvTransition, TransitionKey
 from lerobot.utils.constants import OBS_STATE
+from lerobot.utils.pose6d import POSE_FRAMES, pose_group_names, pose_to_absolute, pose_to_relative
 
 from .delta_action_processor import MapDeltaActionToRobotActionStep, MapTensorToDeltaActionDictStep
 from .pipeline import PolicyProcessorPipeline, ProcessorStep, ProcessorStepRegistry
@@ -99,6 +100,34 @@ def to_absolute_actions(actions: Tensor, state: Tensor, mask: Sequence[bool]) ->
     return actions
 
 
+def _current_state(state: Tensor, actions: Tensor) -> Tensor:
+    """State on the actions' device/dtype, collapsed to the current frame (see to_relative_actions)."""
+    if state.device != actions.device or state.dtype != actions.dtype:
+        state = state.to(device=actions.device, dtype=actions.dtype)
+    return state[:, 0] if state.ndim == 3 else state
+
+
+def _apply_pose_groups(
+    actions: Tensor,
+    state: Tensor,
+    groups: Sequence[tuple[list[int], list[int]]],
+    frame: str,
+    to_relative: bool,
+) -> Tensor:
+    """Convert each (action_idx, state_idx) pose group of ``actions`` against ``state``."""
+    if not groups:
+        return actions
+    state = _current_state(state, actions)
+    actions = actions.clone()
+    convert = pose_to_relative if to_relative else pose_to_absolute
+    for action_idx, state_idx in groups:
+        reference = state[..., state_idx]
+        if actions.ndim == 3:
+            reference = reference.unsqueeze(-2)
+        actions[..., action_idx] = convert(actions[..., action_idx], reference, frame)
+    return actions
+
+
 @ProcessorStepRegistry.register("relative_actions_processor")
 @dataclass
 class RelativeActionsProcessorStep(ProcessorStep):
@@ -109,18 +138,82 @@ class RelativeActionsProcessorStep(ProcessorStep):
     Caches the last seen state so a paired AbsoluteActionsProcessorStep can reverse
     the conversion during postprocessing.
 
+    Pose groups: dims that hold an SE(3) pose as ``<prefix>_x/_y/_z/_rot6d_0.._rot6d_5``
+    cannot be made relative by subtraction. Each prefix in ``pose_groups`` is converted
+    as a whole with :func:`lerobot.utils.pose6d.pose_to_relative` against the state
+    dims of the same names, and is left out of the elementwise mask.
+
     Attributes:
         enabled: Whether to apply the relative conversion.
         exclude_joints: Joint names to keep absolute (not converted to relative).
         action_names: Action dimension names from dataset metadata, used to build
             the mask from exclude_joints. If None, all dims are converted.
+        state_names: State dimension names, used to find each pose group's reference
+            dims in the state. If None, a pose group uses the same indices as in the action.
+        pose_groups: Name prefixes of xyz+rot6d pose groups, e.g. ``["right_ee", "left_ee"]``.
+        pose_frame: ``"ee"`` (relative to the reference pose's own frame) or ``"world"``.
     """
 
     enabled: bool = False
     exclude_joints: list[str] = field(default_factory=list)
     action_names: list[str] | None = None
+    state_names: list[str] | None = None
+    pose_groups: list[str] = field(default_factory=list)
+    pose_frame: str = "ee"
     _last_state: torch.Tensor | None = field(default=None, init=False, repr=False)
     _count_queued_actions: Callable[[], int] | None = field(default=None, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.pose_frame not in POSE_FRAMES:
+            raise ValueError(f"pose_frame must be one of {POSE_FRAMES}, got {self.pose_frame!r}")
+
+    def _pose_index_groups(self) -> list[tuple[list[int], list[int]]]:
+        """(action indices, state indices) of every pose group, resolved by feature name."""
+        if not self.pose_groups:
+            return []
+        if self.action_names is None:
+            raise ValueError("pose_groups need action_names to locate the pose dims")
+        action_names = [str(n) for n in self.action_names]
+        state_names = [str(n) for n in self.state_names] if self.state_names is not None else None
+        groups = []
+        for prefix in self.pose_groups:
+            names = pose_group_names(prefix)
+            missing = [n for n in names if n not in action_names]
+            if missing:
+                raise ValueError(f"pose group {prefix!r}: action has no dims named {missing}")
+            action_idx = [action_names.index(n) for n in names]
+            if state_names is None:
+                state_idx = action_idx
+            else:
+                missing = [n for n in names if n not in state_names]
+                if missing:
+                    raise ValueError(f"pose group {prefix!r}: state has no dims named {missing}")
+                state_idx = [state_names.index(n) for n in names]
+            groups.append((action_idx, state_idx))
+        return groups
+
+    def _build_elementwise_mask(self, action_dim: int) -> list[bool]:
+        """The subtraction mask with every pose-group dim removed (those are composed, not subtracted)."""
+        mask = self._build_mask(action_dim)
+        for action_idx, _ in self._pose_index_groups():
+            for i in action_idx:
+                if not mask[i]:
+                    raise ValueError(
+                        f"action dim {self.action_names[i]!r} is both excluded (exclude_joints) and "
+                        "part of a pose group; a pose group must be converted as a whole"
+                    )
+                mask[i] = False
+        return mask
+
+    def to_relative(self, action: Tensor, state: Tensor) -> Tensor:
+        """Absolute -> relative for ``(B, T, D)`` or ``(B, D)`` actions; also used for the stats."""
+        action = to_relative_actions(action, state, self._build_elementwise_mask(action.shape[-1]))
+        return _apply_pose_groups(action, state, self._pose_index_groups(), self.pose_frame, True)
+
+    def to_absolute(self, action: Tensor, state: Tensor) -> Tensor:
+        """Relative -> absolute; exact inverse of :meth:`to_relative`."""
+        action = to_absolute_actions(action, state, self._build_elementwise_mask(action.shape[-1]))
+        return _apply_pose_groups(action, state, self._pose_index_groups(), self.pose_frame, False)
 
     def _build_mask(self, action_dim: int) -> list[bool]:
         if not self.exclude_joints or self.action_names is None:
@@ -161,8 +254,7 @@ class RelativeActionsProcessorStep(ProcessorStep):
         if not isinstance(action, torch.Tensor):
             raise ValueError(f"RelativeActionsProcessorStep expects a tensor action, got {type(action)}")
 
-        mask = self._build_mask(action.shape[-1])
-        new_transition[TransitionKey.ACTION] = to_relative_actions(action, state, mask)
+        new_transition[TransitionKey.ACTION] = self.to_relative(action, state)
         return new_transition
 
     def reset(self) -> None:
@@ -184,6 +276,9 @@ class RelativeActionsProcessorStep(ProcessorStep):
             "enabled": self.enabled,
             "exclude_joints": self.exclude_joints,
             "action_names": self.action_names,
+            "state_names": self.state_names,
+            "pose_groups": self.pose_groups,
+            "pose_frame": self.pose_frame,
         }
 
     def transform_features(
@@ -233,8 +328,7 @@ class AbsoluteActionsProcessorStep(ProcessorStep):
         if not isinstance(action, torch.Tensor):
             raise ValueError(f"AbsoluteActionsProcessorStep expects a tensor action, got {type(action)}")
 
-        mask = self.relative_step._build_mask(action.shape[-1])
-        new_transition[TransitionKey.ACTION] = to_absolute_actions(action, cached_state, mask)
+        new_transition[TransitionKey.ACTION] = self.relative_step.to_absolute(action, cached_state)
         return new_transition
 
     def get_config(self) -> dict[str, Any]:

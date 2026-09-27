@@ -68,8 +68,15 @@ class PI05Config(PreTrainedConfig):
     use_relative_actions: bool = False
     # Joint names to exclude from relative (kept absolute). Empty list = all dims relative.
     relative_exclude_joints: list[str] = field(default_factory=lambda: ["gripper"])
+    # Pose groups made relative as SE(3) poses (composition) instead of by subtraction: name
+    # prefixes whose dims are <prefix>_x/_y/_z/_rot6d_0.._rot6d_5 in both action and state,
+    # e.g. ["right_ee", "left_ee"]. Requires use_relative_actions.
+    relative_pose_groups: list[str] = field(default_factory=list)
+    # "ee": relative to the current pose's own frame; "world": world-frame displacement.
+    relative_pose_frame: str = "ee"
     # Populated at runtime from dataset metadata by make_policy.
     action_feature_names: list[str] | None = None
+    state_feature_names: list[str] | None = None
 
     # Real-Time Chunking (RTC) configuration
     rtc_config: RTCConfig | None = None
@@ -141,6 +148,11 @@ class PI05Config(PreTrainedConfig):
 
         if self.dtype not in ["bfloat16", "float32"]:
             raise ValueError(f"Invalid dtype: {self.dtype}")
+
+        if self.relative_pose_groups and not self.use_relative_actions:
+            raise ValueError("relative_pose_groups requires use_relative_actions=True")
+        if self.relative_pose_frame not in ["ee", "world"]:
+            raise ValueError(f"Invalid relative_pose_frame: {self.relative_pose_frame}")
 
         if self.memory_frames < 1:
             raise ValueError("memory_frames must be at least 1")

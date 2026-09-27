@@ -1620,6 +1620,8 @@ def recompute_stats(
     relative_exclude_joints: list[str] | None = None,
     chunk_size: int = 50,
     num_workers: int = 0,
+    relative_pose_groups: list[str] | None = None,
+    relative_pose_frame: str = "ee",
 ) -> LeRobotDataset:
     """Recompute stats.json from scratch by iterating all episodes.
 
@@ -1637,6 +1639,10 @@ def recompute_stats(
             ``policy.chunk_size``. Only used when ``relative_action=True``.
         num_workers: Number of parallel threads for relative action stats computation.
             Values ≤1 mean single-threaded. Only used when ``relative_action=True``.
+        relative_pose_groups: Name prefixes of xyz+rot6d pose groups (e.g. ``["right_ee"]``)
+            made relative as SE(3) poses rather than by subtraction. Should match
+            ``policy.relative_pose_groups``. Only used when ``relative_action=True``.
+        relative_pose_frame: ``"ee"`` or ``"world"``; should match ``policy.relative_pose_frame``.
 
     Returns:
         The same dataset with updated stats.
@@ -1669,6 +1675,8 @@ def recompute_stats(
             chunk_size=chunk_size,
             exclude_joints=relative_exclude_joints,
             num_workers=num_workers,
+            pose_groups=relative_pose_groups,
+            pose_frame=relative_pose_frame,
         )
         features_to_compute.pop(ACTION, None)
 

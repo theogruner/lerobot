@@ -201,6 +201,16 @@ Recompute stats for relative actions and push to hub:
         --operation.num_workers 4 \
         --push_to_hub true
 
+Recompute stats for relative actions with xyz+rot6d end-effector poses (SE(3), not subtraction):
+    lerobot-edit-dataset \
+        --repo_id my/bimanual_ee \
+        --operation.type recompute_stats \
+        --operation.relative_action true \
+        --operation.chunk_size 50 \
+        --operation.relative_exclude_joints "['gripper']" \
+        --operation.relative_pose_groups "['right_ee', 'left_ee']" \
+        --operation.relative_pose_frame ee
+
 Re-encode all videos in a dataset (saves to lerobot/pusht_reencoded by default):
     lerobot-edit-dataset \
         --repo_id lerobot/pusht \
@@ -331,6 +341,8 @@ class RecomputeStatsConfig(OperationConfig):
     skip_image_video: bool = True
     relative_action: bool = False
     relative_exclude_joints: list[str] | None = None
+    relative_pose_groups: list[str] | None = None
+    relative_pose_frame: str = "ee"
     chunk_size: int = 50
     num_workers: int = 0
     overwrite: bool = False
@@ -736,7 +748,8 @@ def handle_recompute_stats(cfg: EditDatasetConfig) -> None:
     if cfg.operation.relative_action:
         logging.info(
             f"Relative action stats enabled (chunk_size={cfg.operation.chunk_size}, "
-            f"exclude_joints={cfg.operation.relative_exclude_joints})"
+            f"exclude_joints={cfg.operation.relative_exclude_joints}, "
+            f"pose_groups={cfg.operation.relative_pose_groups}, pose_frame={cfg.operation.relative_pose_frame})"
         )
 
     recompute_stats(
@@ -746,6 +759,8 @@ def handle_recompute_stats(cfg: EditDatasetConfig) -> None:
         relative_exclude_joints=cfg.operation.relative_exclude_joints,
         chunk_size=cfg.operation.chunk_size,
         num_workers=cfg.operation.num_workers,
+        relative_pose_groups=cfg.operation.relative_pose_groups,
+        relative_pose_frame=cfg.operation.relative_pose_frame,
     )
 
     logging.info(f"Stats written to {dataset.root}")

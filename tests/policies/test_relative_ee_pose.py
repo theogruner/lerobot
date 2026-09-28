@@ -300,3 +300,106 @@ def test_factory_reads_state_and_grouped_names():
     assert _dataset_feature_names(meta, ACTION, None) == ACTION_NAMES
     assert _dataset_feature_names(meta, OBS_STATE, {"observation.state_raw": OBS_STATE}) == STATE_NAMES
     assert _dataset_feature_names(meta, OBS_STATE, None) is None
+
+
+# pipelines built from checkpoints that predate relative actions (e.g. xvla-base)
+
+
+def _bare_pipelines():
+    from lerobot.processor import (
+        AddBatchDimensionProcessorStep,
+        DeviceProcessorStep,
+        UnnormalizerProcessorStep,
+        make_policy_processor_pipelines,
+    )
+
+    return make_policy_processor_pipelines(
+        input_steps=[AddBatchDimensionProcessorStep(), DeviceProcessorStep(device="cpu")],
+        output_steps=[UnnormalizerProcessorStep(features={}, norm_map={}), DeviceProcessorStep(device="cpu")],
+    )
+
+
+def _ee_step_config(**kwargs):
+    return dict(
+        exclude_joints=["gripper"],
+        action_names=ACTION_NAMES,
+        state_names=STATE_NAMES,
+        pose_groups=["right_ee", "left_ee"],
+        pose_frame="ee",
+        **kwargs,
+    )
+
+
+def test_ensure_inserts_steps_where_factories_put_them():
+    from lerobot.processor.relative_action_processor import ensure_relative_action_steps
+
+    pre, post = _bare_pipelines()
+    relative = ensure_relative_action_steps(pre, post, **_ee_step_config())
+    assert [type(s).__name__ for s in pre.steps] == [
+        "AddBatchDimensionProcessorStep",
+        "RelativeActionsProcessorStep",
+        "DeviceProcessorStep",
+    ]
+    assert [type(s).__name__ for s in post.steps] == [
+        "UnnormalizerProcessorStep",
+        "AbsoluteActionsProcessorStep",
+        "DeviceProcessorStep",
+    ]
+    assert relative.enabled and post.steps[1].enabled and post.steps[1].relative_step is relative
+
+    action, state = _random_ee_vectors((2, 50), seed=40), _random_ee_vectors((2,), seed=41)
+    out = pre({ACTION: action, OBS_STATE: state})
+    torch.testing.assert_close(out[ACTION], relative.to_relative(action, state))
+    torch.testing.assert_close(post(out[ACTION]), action, atol=1e-5, rtol=0)
+
+
+def test_ensure_configures_existing_steps_in_place():
+    from lerobot.processor.relative_action_processor import ensure_relative_action_steps
+
+    pre, post = _bare_pipelines()
+    ensure_relative_action_steps(pre, post, **_ee_step_config())
+    n_pre, n_post = len(pre.steps), len(post.steps)
+    relative = ensure_relative_action_steps(pre, post, **{**_ee_step_config(), "pose_frame": "world"})
+    assert (len(pre.steps), len(post.steps)) == (n_pre, n_post)
+    assert relative.pose_frame == "world"
+    with pytest.raises(ValueError, match="pose_frame"):
+        ensure_relative_action_steps(pre, post, **{**_ee_step_config(), "pose_frame": "base"})
+
+
+def test_xvla_config_validates_pose_groups():
+    pytest.importorskip("transformers")
+    from lerobot.policies.xvla.configuration_xvla import XVLAConfig
+
+    with pytest.raises(ValueError, match="requires use_relative_actions"):
+        XVLAConfig(relative_pose_groups=["right_ee"])
+    with pytest.raises(ValueError, match="relative_pose_frame"):
+        XVLAConfig(use_relative_actions=True, relative_pose_frame="base")
+    cfg = XVLAConfig(use_relative_actions=True, relative_pose_groups=["right_ee", "left_ee"])
+    assert cfg.relative_exclude_joints == ["gripper"] and cfg.state_feature_names is None
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_xvla_factory_places_relative_steps(enabled):
+    pytest.importorskip("transformers")
+    from lerobot.policies.xvla.configuration_xvla import XVLAConfig
+    from lerobot.policies.xvla.processor_xvla import make_xvla_pre_post_processors
+
+    cfg = XVLAConfig(
+        use_relative_actions=enabled,
+        relative_pose_groups=["right_ee", "left_ee"] if enabled else [],
+        action_feature_names=ACTION_NAMES,
+        state_feature_names=STATE_NAMES,
+    )
+    try:
+        pre, post = make_xvla_pre_post_processors(cfg)
+    except OSError as e:  # tokenizer not downloadable in this environment
+        pytest.skip(f"xvla tokenizer unavailable: {e}")
+    pre_names = [type(s).__name__ for s in pre.steps]
+    post_names = [type(s).__name__ for s in post.steps]
+    rel_idx = pre_names.index("RelativeActionsProcessorStep")
+    assert pre_names[rel_idx - 1] == "AddBatchDimensionProcessorStep"
+    assert rel_idx < pre_names.index("NormalizerProcessorStep")
+    abs_idx = post_names.index("AbsoluteActionsProcessorStep")
+    assert post_names[abs_idx - 1] == "UnnormalizerProcessorStep"
+    assert pre.steps[rel_idx].enabled is enabled and post.steps[abs_idx].enabled is enabled
+    assert post.steps[abs_idx].relative_step is pre.steps[rel_idx]

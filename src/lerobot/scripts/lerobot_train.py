@@ -81,6 +81,7 @@ from lerobot.jobs import submit_to_hf
 from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies import PreTrainedPolicy, make_policy, make_pre_post_processors
 from lerobot.policies.factory import ProcessorConfigKwargs
+from lerobot.processor.relative_action_processor import ensure_relative_action_steps
 from lerobot.processor.rename_processor import rename_batch_keys, rename_stats
 from lerobot.rewards import make_reward_pre_post_processors
 from lerobot.utils.collate import lerobot_collate_fn
@@ -603,7 +604,10 @@ def train(cfg: TrainPipelineConfig) -> None:
         if not cfg.resume:
             preprocessor_overrides["normalizer_processor"]["stats"] = processor_dataset_stats
             postprocessor_overrides["unnormalizer_processor"]["stats"] = processor_dataset_stats
-        if getattr(active_cfg, "use_relative_actions", False):
+        # Policies with relative_pose_groups (pi05, xvla) get their relative steps configured after
+        # the pipelines are built (ensure_relative_action_steps below), which also covers
+        # checkpoints whose saved pipelines predate the steps. Others keep the override path.
+        if getattr(active_cfg, "use_relative_actions", False) and not hasattr(active_cfg, "relative_pose_groups"):
             preprocessor_overrides["relative_actions_processor"] = {
                 "enabled": True,
                 "exclude_joints": getattr(active_cfg, "relative_exclude_joints", []),
@@ -627,6 +631,16 @@ def train(cfg: TrainPipelineConfig) -> None:
             pretrained_path=processor_pretrained_path,
             pretrained_revision=active_cfg.pretrained_revision,
             **processor_kwargs,
+        )
+    if getattr(active_cfg, "use_relative_actions", False) and hasattr(active_cfg, "relative_pose_groups"):
+        ensure_relative_action_steps(
+            preprocessor,
+            postprocessor,
+            exclude_joints=list(getattr(active_cfg, "relative_exclude_joints", [])),
+            action_names=getattr(active_cfg, "action_feature_names", None),
+            state_names=getattr(active_cfg, "state_feature_names", None),
+            pose_groups=list(active_cfg.relative_pose_groups),
+            pose_frame=getattr(active_cfg, "relative_pose_frame", "ee"),
         )
 
     # Created BEFORE prepare on the unsharded parameters — accelerate's FSDP2 path requires the

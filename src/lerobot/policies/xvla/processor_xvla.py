@@ -32,6 +32,10 @@ from lerobot.processor import (
     make_default_policy_processor_steps,
     make_policy_processor_pipelines,
 )
+from lerobot.processor.relative_action_processor import (
+    AbsoluteActionsProcessorStep,
+    RelativeActionsProcessorStep,
+)
 from lerobot.utils.constants import (
     IMAGENET_STATS,
     OBS_IMAGES,
@@ -52,13 +56,26 @@ def make_xvla_pre_post_processors(
 ]:
     """
     Build the LeRobot processor pipelines for XVLA.
+
+    With ``config.use_relative_actions`` the actions are made relative to the raw state right
+    after batching (before normalization), and converted back after unnormalization.
     """
+
+    relative_step = RelativeActionsProcessorStep(
+        enabled=config.use_relative_actions,
+        exclude_joints=list(config.relative_exclude_joints),
+        action_names=config.action_feature_names,
+        state_names=config.state_feature_names,
+        pose_groups=list(config.relative_pose_groups),
+        pose_frame=config.relative_pose_frame,
+    )
 
     steps = make_default_policy_processor_steps(config, dataset_stats)
 
     input_steps = [
         steps.rename_observations,
         steps.add_batch_dim,
+        relative_step,
         TokenizerProcessorStep(
             tokenizer_name=config.tokenizer_name,
             max_length=config.tokenizer_max_length,
@@ -73,6 +90,7 @@ def make_xvla_pre_post_processors(
     ]
     output_steps = [
         steps.unnormalize,
+        AbsoluteActionsProcessorStep(enabled=config.use_relative_actions, relative_step=relative_step),
         steps.to_cpu,
     ]
 

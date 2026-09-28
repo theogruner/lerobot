@@ -37,6 +37,7 @@ __all__ = [
     "RelativeActionsProcessorStep",
     "AbsoluteActionsProcessorStep",
     "bind_relative_anchor",
+    "ensure_relative_action_steps",
     "to_relative_actions",
     "to_absolute_actions",
 ]
@@ -338,6 +339,58 @@ class AbsoluteActionsProcessorStep(ProcessorStep):
         self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
     ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
         return features
+
+
+def ensure_relative_action_steps(
+    preprocessor: PolicyProcessorPipeline[Any, Any],
+    postprocessor: PolicyProcessorPipeline[Any, Any],
+    **step_config: Any,
+) -> RelativeActionsProcessorStep:
+    """Enable (and if needed insert) the relative/absolute action pair on built pipelines.
+
+    Pipelines built by a policy factory already hold both steps; pipelines loaded from a
+    checkpoint saved before the policy supported relative actions (e.g. ``lerobot/xvla-base``)
+    hold neither, so name-based preprocessor overrides cannot reach them. This configures the
+    existing steps, or inserts them where the factories put them: the relative step right after
+    batching (it needs the raw, batched state and action), the absolute step right after
+    unnormalization. ``step_config`` holds RelativeActionsProcessorStep fields.
+    """
+    relative = next((s for s in preprocessor.steps if isinstance(s, RelativeActionsProcessorStep)), None)
+    if relative is None:
+        batch_idx = next(
+            (i for i, s in enumerate(preprocessor.steps) if type(s).__name__ == "AddBatchDimensionProcessorStep"),
+            None,
+        )
+        if batch_idx is None:
+            raise ValueError("cannot place RelativeActionsProcessorStep: preprocessor has no batching step")
+        relative = RelativeActionsProcessorStep(**step_config)
+        steps = list(preprocessor.steps)
+        steps.insert(batch_idx + 1, relative)
+        preprocessor.steps = steps
+        # Saved state filenames are per step index; let them be re-derived from the new order.
+        preprocessor._serialized_state_filenames = None
+    else:
+        for name, value in step_config.items():
+            setattr(relative, name, value)
+        relative.__post_init__()
+    relative.enabled = True
+
+    absolute = next((s for s in postprocessor.steps if isinstance(s, AbsoluteActionsProcessorStep)), None)
+    if absolute is None:
+        unnorm_idx = next(
+            (i for i, s in enumerate(postprocessor.steps) if type(s).__name__ == "UnnormalizerProcessorStep"),
+            None,
+        )
+        if unnorm_idx is None:
+            raise ValueError("cannot place AbsoluteActionsProcessorStep: postprocessor has no unnormalizer")
+        absolute = AbsoluteActionsProcessorStep()
+        steps = list(postprocessor.steps)
+        steps.insert(unnorm_idx + 1, absolute)
+        postprocessor.steps = steps
+        postprocessor._serialized_state_filenames = None
+    absolute.enabled = True
+    absolute.relative_step = relative
+    return relative
 
 
 def bind_relative_anchor(

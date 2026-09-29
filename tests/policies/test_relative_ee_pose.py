@@ -403,3 +403,33 @@ def test_xvla_factory_places_relative_steps(enabled):
     assert post_names[abs_idx - 1] == "UnnormalizerProcessorStep"
     assert pre.steps[rel_idx].enabled is enabled and post.steps[abs_idx].enabled is enabled
     assert post.steps[abs_idx].relative_step is pre.steps[rel_idx]
+
+
+# xvla: wider state than xvla-base (latent controller dims) -> widened action_encoder
+
+
+def test_widened_action_encoder_matches_the_original_for_any_new_dims():
+    pytest.importorskip("transformers")
+    from lerobot.policies.xvla.modeling_xvla import widen_action_encoder_weight
+    from lerobot.policies.xvla.soft_transformer import DomainAwareLinear
+
+    dim_action, dim_time, hidden, domains = 4, 2, 5, 3
+    old = DomainAwareLinear(dim_action + 3 + dim_time, hidden, num_domains=domains)
+    new = DomainAwareLinear(dim_action + 7 + dim_time, hidden, num_domains=domains)
+    new.fc.weight.data = widen_action_encoder_weight(old.fc.weight.data, hidden, dim_action, dim_time, 7)
+    new.bias.weight.data = old.bias.weight.data.clone()
+
+    action, proprio, time = torch.randn(2, 6, dim_action), torch.randn(2, 6, 3), torch.randn(2, 6, dim_time)
+    extra = torch.randn(2, 6, 4)  # the new state dims: must not change the output at initialisation
+    domain = torch.tensor([0, 2])
+    y_old = old(torch.cat([action, proprio, time], -1), domain)
+    y_new = new(torch.cat([action, proprio, extra, time], -1), domain)
+    torch.testing.assert_close(y_new, y_old)
+
+
+def test_widen_action_encoder_refuses_to_shrink():
+    pytest.importorskip("transformers")
+    from lerobot.policies.xvla.modeling_xvla import widen_action_encoder_weight
+
+    with pytest.raises(ValueError, match="shrink"):
+        widen_action_encoder_weight(torch.zeros(1, (4 + 7 + 2) * 5), 5, 4, 2, 3)

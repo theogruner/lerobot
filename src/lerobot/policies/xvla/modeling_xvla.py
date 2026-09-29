@@ -502,6 +502,9 @@ class XVLAPolicy(PreTrainedPolicy):
             state_dict[embed_key] = state_dict[shared_key]
         elif embed_key in state_dict and shared_key not in state_dict:
             state_dict[shared_key] = state_dict[embed_key]
+        # A config with a wider state than the checkpoint (max_state_dim > its 20, e.g. extra
+        # latent-controller dims) changes action_encoder's input width: widen it, new rows zero.
+        _widen_action_encoder_for_proprio(state_dict, instance)
         # step 4: load into instance
         instance.load_state_dict(state_dict, strict=True)
         logging.info("Loaded XVLA checkpoint")
@@ -590,3 +593,46 @@ def pad_tensor_along_dim(tensor: Tensor, target_len: int, dim: int = 1) -> Tenso
     pad_shape[dim] = target_len - current_len
     pad_tensor = tensor.new_zeros(pad_shape)
     return torch.cat([tensor, pad_tensor], dim=dim)
+
+
+def widen_action_encoder_weight(
+    weight: Tensor, hidden_size: int, dim_action: int, dim_time: int, new_dim_proprio: int
+) -> Tensor:
+    """Widen a DomainAwareLinear action_encoder weight to a larger proprio input.
+
+    The encoder consumes ``cat([noisy action, proprio, time])``; its weight is stored per domain
+    as a flattened (input_size, hidden_size) matrix. The action and time rows keep their values,
+    the existing proprio rows stay in place and the new proprio rows are zero, so for any
+    input the widened layer returns exactly what the checkpoint did: the new state dims have no
+    effect until training gives them weight.
+    """
+    num_domains = weight.shape[0]
+    old_in = weight.shape[1] // hidden_size
+    old_dim_proprio = old_in - dim_action - dim_time
+    if new_dim_proprio < old_dim_proprio:
+        raise ValueError(f"cannot shrink the proprio input from {old_dim_proprio} to {new_dim_proprio}")
+    w = weight.view(num_domains, old_in, hidden_size)
+    new_in = dim_action + new_dim_proprio + dim_time
+    widened = w.new_zeros(num_domains, new_in, hidden_size)
+    keep = dim_action + old_dim_proprio
+    widened[:, :keep] = w[:, :keep]
+    widened[:, dim_action + new_dim_proprio :] = w[:, keep:]
+    return widened.reshape(num_domains, new_in * hidden_size)
+
+
+def _widen_action_encoder_for_proprio(state_dict: dict[str, Tensor], instance: nn.Module) -> None:
+    for key in [k for k in state_dict if k.endswith("action_encoder.fc.weight")]:
+        target = dict(instance.named_parameters()).get(key)
+        if target is None or target.shape == state_dict[key].shape:
+            continue
+        encoder = instance.get_submodule(key[: -len(".fc.weight")])
+        model = instance.model
+        new_dim_proprio = encoder.input_size - model.dim_action - model.transformer.dim_time
+        old_in = state_dict[key].shape[1] // encoder.output_size
+        logging.info(
+            f"Widening {key}: proprio input {old_in - model.dim_action - model.transformer.dim_time} -> "
+            f"{new_dim_proprio} (new rows zero-initialised)"
+        )
+        state_dict[key] = widen_action_encoder_weight(
+            state_dict[key], encoder.output_size, model.dim_action, model.transformer.dim_time, new_dim_proprio
+        )

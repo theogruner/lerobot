@@ -306,6 +306,12 @@ class XVLAPolicy(PreTrainedPolicy):
         state = batch[OBS_STATE]
         if state.ndim > 2:
             state = state[:, -1, :]
+        if self.config.proprio_state_names is not None:
+            if getattr(self, "_proprio_idx", None) is None:
+                self._proprio_idx = resolve_proprio_indices(
+                    self.config.state_feature_names, self.config.proprio_state_names
+                )
+            state = state[..., self._proprio_idx]
         return pad_vector(state, self.model.dim_proprio, truncate=True)
 
     def _prepare_images(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
@@ -505,6 +511,10 @@ class XVLAPolicy(PreTrainedPolicy):
         # A config with a wider state than the checkpoint (max_state_dim > its 20, e.g. extra
         # latent-controller dims) changes action_encoder's input width: widen it, new rows zero.
         _widen_action_encoder_for_proprio(state_dict, instance)
+        if config.reset_proprio_weights:
+            _zero_action_encoder_proprio(state_dict, instance)
+            # One-shot: saved checkpoints must reload their trained proprio weights untouched.
+            config.reset_proprio_weights = False
         # step 4: load into instance
         instance.load_state_dict(state_dict, strict=True)
         logging.info("Loaded XVLA checkpoint")
@@ -635,4 +645,35 @@ def _widen_action_encoder_for_proprio(state_dict: dict[str, Tensor], instance: n
         )
         state_dict[key] = widen_action_encoder_weight(
             state_dict[key], encoder.output_size, model.dim_action, model.transformer.dim_time, new_dim_proprio
+        )
+
+
+def resolve_proprio_indices(state_names: list[str] | None, wanted: list[str]) -> list[int]:
+    """Indices of ``wanted`` in ``observation.state``'s dimension names (for proprio_state_names)."""
+    if state_names is None:
+        raise ValueError("proprio_state_names needs state_feature_names (set by make_policy from the dataset)")
+    names = [str(n) for n in state_names]
+    missing = [n for n in wanted if n not in names]
+    if missing:
+        raise ValueError(f"proprio_state_names not in observation.state: {missing}")
+    return [names.index(n) for n in wanted]
+
+
+def zero_action_encoder_proprio_rows(
+    weight: Tensor, hidden_size: int, dim_action: int, dim_proprio: int
+) -> Tensor:
+    """Zero the proprio input rows of a DomainAwareLinear action_encoder weight (all domains)."""
+    num_domains = weight.shape[0]
+    w = weight.view(num_domains, -1, hidden_size).clone()
+    w[:, dim_action : dim_action + dim_proprio] = 0
+    return w.reshape(num_domains, -1)
+
+
+def _zero_action_encoder_proprio(state_dict: dict[str, Tensor], instance: nn.Module) -> None:
+    model = instance.model
+    for key in [k for k in state_dict if k.endswith("action_encoder.fc.weight")]:
+        encoder = instance.get_submodule(key[: -len(".fc.weight")])
+        logging.info(f"Zeroing the {model.dim_proprio} proprio rows of {key} (reset_proprio_weights)")
+        state_dict[key] = zero_action_encoder_proprio_rows(
+            state_dict[key], encoder.output_size, model.dim_action, model.dim_proprio
         )

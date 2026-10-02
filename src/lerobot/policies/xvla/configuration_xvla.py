@@ -140,6 +140,15 @@ class XVLAConfig(PreTrainedConfig):
     # Populated at runtime from dataset metadata by make_policy.
     action_feature_names: list[str] | None = None
     state_feature_names: list[str] | None = None
+    # Model state input. None: all of observation.state (padded/truncated to max_state_dim). A list:
+    # only these observation.state dims, by name and in this order -- e.g. just the controller latent,
+    # so the policy cannot read the absolute pose while the relative-action processors still anchor
+    # on it (they always see the full observation.state). Note ee6d zeroes input positions 9 and 19.
+    proprio_state_names: list[str] | None = None
+    # Zero the checkpoint's proprio rows of action_encoder when loading, so the model starts out
+    # ignoring the state (e.g. when proprio_state_names changes what the state slots mean).
+    # One-shot: cleared after it is applied, so checkpoints saved from the run reload intact.
+    reset_proprio_weights: bool = False
 
     # Vision preprocessing
     resize_imgs_with_padding: tuple[int, int] | None = None
@@ -184,6 +193,11 @@ class XVLAConfig(PreTrainedConfig):
             raise ValueError("relative_pose_groups requires use_relative_actions=True")
         if self.relative_pose_frame not in ["ee", "world"]:
             raise ValueError(f"Invalid relative_pose_frame: {self.relative_pose_frame}")
+        if self.proprio_state_names is not None and len(self.proprio_state_names) > self.max_state_dim:
+            raise ValueError(
+                f"proprio_state_names selects {len(self.proprio_state_names)} dims but max_state_dim is "
+                f"{self.max_state_dim}; the extra dims would be truncated"
+            )
         self._florence_config_obj: Florence2Config | None = None
 
     def get_florence_config(self) -> Florence2Config:

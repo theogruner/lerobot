@@ -433,3 +433,46 @@ def test_widen_action_encoder_refuses_to_shrink():
 
     with pytest.raises(ValueError, match="shrink"):
         widen_action_encoder_weight(torch.zeros(1, (4 + 7 + 2) * 5), 5, 4, 2, 3)
+
+
+# xvla: model state input restricted by name (proprio_state_names) + reset of pretrained proprio rows
+
+
+def test_resolve_proprio_indices_by_name():
+    pytest.importorskip("transformers")
+    from lerobot.policies.xvla.modeling_xvla import resolve_proprio_indices
+
+    names = ["right_ee_x", "right_gripper_finger", "right_cmd_dx", "left_cmd_dx"]
+    assert resolve_proprio_indices(names, ["right_cmd_dx", "right_gripper_finger", "left_cmd_dx"]) == [2, 1, 3]
+    with pytest.raises(ValueError, match="not in observation.state"):
+        resolve_proprio_indices(names, ["left_ee_x"])
+    with pytest.raises(ValueError, match="state_feature_names"):
+        resolve_proprio_indices(None, ["right_cmd_dx"])
+
+
+def test_zeroed_proprio_rows_make_the_encoder_ignore_the_state():
+    pytest.importorskip("transformers")
+    from lerobot.policies.xvla.modeling_xvla import zero_action_encoder_proprio_rows
+    from lerobot.policies.xvla.soft_transformer import DomainAwareLinear
+
+    dim_action, dim_proprio, dim_time, hidden = 4, 3, 2, 5
+    enc = DomainAwareLinear(dim_action + dim_proprio + dim_time, hidden, num_domains=2)
+    before = enc.fc.weight.data.clone()
+    enc.fc.weight.data = zero_action_encoder_proprio_rows(enc.fc.weight.data, hidden, dim_action, dim_proprio)
+    a, t, d = torch.randn(2, 6, dim_action), torch.randn(2, 6, dim_time), torch.tensor([0, 1])
+    y1 = enc(torch.cat([a, torch.randn(2, 6, dim_proprio), t], -1), d)
+    y2 = enc(torch.cat([a, torch.randn(2, 6, dim_proprio), t], -1), d)
+    torch.testing.assert_close(y1, y2)  # the state no longer matters
+    w_old = before.view(2, -1, hidden)
+    w_new = enc.fc.weight.data.view(2, -1, hidden)
+    torch.testing.assert_close(w_new[:, :dim_action], w_old[:, :dim_action])  # action + time rows untouched
+    torch.testing.assert_close(w_new[:, dim_action + dim_proprio :], w_old[:, dim_action + dim_proprio :])
+
+
+def test_xvla_config_rejects_more_proprio_names_than_max_state_dim():
+    pytest.importorskip("transformers")
+    from lerobot.policies.xvla.configuration_xvla import XVLAConfig
+
+    with pytest.raises(ValueError, match="truncated"):
+        XVLAConfig(max_state_dim=2, proprio_state_names=["a", "b", "c"])
+    assert XVLAConfig(proprio_state_names=["a"]).reset_proprio_weights is False
